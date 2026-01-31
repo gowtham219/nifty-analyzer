@@ -24,6 +24,62 @@ except Exception:
 
 
 # =========================
+# Time helpers (IST logic)
+# =========================
+IST_OFFSET = dt.timedelta(hours=5, minutes=30)
+
+def now_ist() -> dt.datetime:
+    return dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc).astimezone(dt.timezone(IST_OFFSET))
+
+def is_market_open_ist(t: Optional[dt.datetime] = None) -> bool:
+    """
+    NSE Cash/Index hours (approx): 09:15 to 15:30 IST, Mon-Fri.
+    (Holidays not included — requires NSE holiday calendar.)
+    """
+    t = t or now_ist()
+    if t.weekday() >= 5:  # Sat/Sun
+        return False
+    start = t.replace(hour=9, minute=15, second=0, microsecond=0)
+    end   = t.replace(hour=15, minute=30, second=0, microsecond=0)
+    return start <= t <= end
+
+def next_market_open_ist(t: Optional[dt.datetime] = None) -> dt.datetime:
+    """
+    Best-effort next opening time (IST).
+    - If before 09:15 on a weekday → today 09:15
+    - Else next weekday 09:15
+    (Does not account for holidays.)
+    """
+    t = t or now_ist()
+    start_today = t.replace(hour=9, minute=15, second=0, microsecond=0)
+    end_today   = t.replace(hour=15, minute=30, second=0, microsecond=0)
+
+    # Weekend -> next Monday 09:15
+    if t.weekday() == 5:  # Sat
+        days = 2
+        return (t + dt.timedelta(days=days)).replace(hour=9, minute=15, second=0, microsecond=0)
+    if t.weekday() == 6:  # Sun
+        days = 1
+        return (t + dt.timedelta(days=days)).replace(hour=9, minute=15, second=0, microsecond=0)
+
+    # Weekday cases
+    if t < start_today:
+        return start_today
+    if t > end_today:
+        # next weekday
+        nxt = t + dt.timedelta(days=1)
+        while nxt.weekday() >= 5:
+            nxt += dt.timedelta(days=1)
+        return nxt.replace(hour=9, minute=15, second=0, microsecond=0)
+
+    # If during market hours, "next open" is tomorrow 09:15
+    nxt = t + dt.timedelta(days=1)
+    while nxt.weekday() >= 5:
+        nxt += dt.timedelta(days=1)
+    return nxt.replace(hour=9, minute=15, second=0, microsecond=0)
+
+
+# =========================
 # NSE Client (Options Chain)
 # =========================
 class NSEWebClient:
@@ -130,6 +186,7 @@ def vwap(df: pd.DataFrame) -> pd.Series:
 # =========================
 # yfinance fetchers
 # =========================
+@st.cache_data(ttl=60, show_spinner=False)
 def fetch_intraday_5m_yf(ticker: str, days: int = 5) -> pd.DataFrame:
     if yf is None:
         return pd.DataFrame()
@@ -143,11 +200,12 @@ def fetch_intraday_5m_yf(ticker: str, days: int = 5) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
-def fetch_daily_yf(ticker: str, days: int = 30) -> pd.DataFrame:
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_daily_yf(ticker: str, days: int = 90) -> pd.DataFrame:
     if yf is None:
         return pd.DataFrame()
     try:
-        df = yf.download(ticker, period="3mo", interval="1d", progress=False, auto_adjust=False)
+        df = yf.download(ticker, period="6mo", interval="1d", progress=False, auto_adjust=False)
         if df is None or df.empty:
             return pd.DataFrame()
         df = df.rename(columns={"Open":"Open","High":"High","Low":"Low","Close":"Close","Volume":"Volume"}).copy()
@@ -195,7 +253,7 @@ def option_chain_table(oc: dict, expiry: str) -> pd.DataFrame:
 
 
 # =========================
-# Code-2 style plan (Index)
+# Trade Plan (Index)
 # =========================
 @dataclass
 class TradePlan:
@@ -269,30 +327,58 @@ def build_multi_strike_table(
     plan: Optional[TradePlan],
     capital: float,
     risk_percent: float,
+    force_null: bool = False
 ) -> pd.DataFrame:
+    """
+    force_null=True: show strikes but keep all option values NULL (market closed behavior).
+    """
     risk_amount = capital * (risk_percent / 100.0)
     rows = []
 
     for strike in strikes:
         row = {"Strike": int(strike)}
 
+        # Default NULL row if forced
+        if force_null:
+            row.update({
+                "CALL_Signal": None, "CALL_Premium": None, "CALL_Entry": None, "CALL_SL": None, "CALL_TGT": None, "CALL_Qty": None,
+                "PUT_Signal": None,  "PUT_Premium": None,  "PUT_Entry": None,  "PUT_SL": None,  "PUT_TGT": None,  "PUT_Qty": None,
+                "CE_OI": None, "PE_OI": None, "CE_ChgOI": None, "PE_ChgOI": None
+            })
+            rows.append(row)
+            continue
+
         ce_ltp = np.nan
         pe_ltp = np.nan
-        m = oc_df[oc_df["Strike"] == strike]
+        ce_oi = np.nan
+        pe_oi = np.nan
+        ce_chg = np.nan
+        pe_chg = np.nan
+
+        m = oc_df[oc_df["Strike"] == strike] if (oc_df is not None and not oc_df.empty) else pd.DataFrame()
         if not m.empty:
             ce_ltp = float(m.iloc[0]["CE_LTP"]) if not pd.isna(m.iloc[0]["CE_LTP"]) else np.nan
             pe_ltp = float(m.iloc[0]["PE_LTP"]) if not pd.isna(m.iloc[0]["PE_LTP"]) else np.nan
+            ce_oi  = float(m.iloc[0]["CE_OI"])  if not pd.isna(m.iloc[0]["CE_OI"])  else np.nan
+            pe_oi  = float(m.iloc[0]["PE_OI"])  if not pd.isna(m.iloc[0]["PE_OI"])  else np.nan
+            ce_chg = float(m.iloc[0]["CE_ChgOI"]) if not pd.isna(m.iloc[0]["CE_ChgOI"]) else np.nan
+            pe_chg = float(m.iloc[0]["PE_ChgOI"]) if not pd.isna(m.iloc[0]["PE_ChgOI"]) else np.nan
 
         premium_mult = 0.15  # tune 0.10–0.25
 
-        # Defaults
         row.update({
             "CALL_Signal": "NO TRADE",
             "CALL_Premium": (round(ce_ltp, 2) if not math.isnan(ce_ltp) else None),
             "CALL_Entry": None, "CALL_SL": None, "CALL_TGT": None, "CALL_Qty": None,
+
             "PUT_Signal": "NO TRADE",
             "PUT_Premium": (round(pe_ltp, 2) if not math.isnan(pe_ltp) else None),
             "PUT_Entry": None, "PUT_SL": None, "PUT_TGT": None, "PUT_Qty": None,
+
+            "CE_OI": (int(ce_oi) if not math.isnan(ce_oi) else None),
+            "PE_OI": (int(pe_oi) if not math.isnan(pe_oi) else None),
+            "CE_ChgOI": (int(ce_chg) if not math.isnan(ce_chg) else None),
+            "PE_ChgOI": (int(pe_chg) if not math.isnan(pe_chg) else None),
         })
 
         if plan is None:
@@ -334,46 +420,49 @@ def build_multi_strike_table(
 
 
 # =========================
-# Yesterday snapshot (daily)
+# Last Trading Day Snapshot (daily)
 # =========================
-def yesterday_summary(daily: pd.DataFrame) -> Optional[Dict[str, float]]:
+def last_trading_day_summary(daily: pd.DataFrame) -> Optional[Dict[str, object]]:
     """
-    Needs at least 3 daily candles to compute yesterday & day-before.
+    This is BETTER than 'yesterday' when market is closed or weekend.
+    Uses:
+      last_day = last available daily candle
+      prev_day = candle before that
     """
-    if daily is None or daily.empty or len(daily) < 3:
+    if daily is None or daily.empty or len(daily) < 2:
         return None
 
     d = daily.copy().dropna(subset=["Close"])
-    if len(d) < 3:
+    if len(d) < 2:
         return None
 
-    y = d.iloc[-2]
-    p = d.iloc[-3]
+    last_day = d.iloc[-1]
+    prev_day = d.iloc[-2]
 
-    y_open = float(y["Open"])
-    y_high = float(y["High"])
-    y_low  = float(y["Low"])
-    y_close= float(y["Close"])
-    p_close= float(p["Close"])
+    o = float(last_day["Open"])
+    h = float(last_day["High"])
+    l = float(last_day["Low"])
+    c = float(last_day["Close"])
+    p_close = float(prev_day["Close"])
 
-    y_pct = ((y_close / p_close) - 1) * 100.0 if p_close else np.nan
-    gap = ((y_open / p_close) - 1) * 100.0 if p_close else np.nan
-    rng = y_high - y_low
-    body = abs(y_close - y_open)
+    pct = ((c / p_close) - 1) * 100.0 if p_close else np.nan
+    gap = ((o / p_close) - 1) * 100.0 if p_close else np.nan
+    rng = h - l
+    body = abs(c - o)
     body_pct = (body / rng * 100.0) if rng else np.nan
-    close_pos = ((y_close - y_low) / rng * 100.0) if rng else np.nan
+    close_pos = ((c - l) / rng * 100.0) if rng else np.nan
 
-    direction = "Bullish" if y_close > y_open else "Bearish" if y_close < y_open else "Doji/Flat"
-    volatility = "High" if (rng / y_close) > 0.015 else "Medium" if (rng / y_close) > 0.008 else "Low"
+    direction = "Bullish" if c > o else "Bearish" if c < o else "Doji/Flat"
+    volatility = "High" if (rng / c) > 0.015 else "Medium" if (rng / c) > 0.008 else "Low"
 
-    midpoint = (y_high + y_low) / 2.0
-    held_mid = "YES" if y_close >= midpoint else "NO"
+    midpoint = (h + l) / 2.0
+    held_mid = "YES" if c >= midpoint else "NO"
 
-    y_date = d.index[-2].date()
+    date_val = d.index[-1].date()
     return {
-        "date": y_date,
-        "open": y_open, "high": y_high, "low": y_low, "close": y_close,
-        "pct": y_pct, "gap": gap, "range": rng,
+        "date": date_val,
+        "open": o, "high": h, "low": l, "close": c,
+        "pct": pct, "gap": gap, "range": rng,
         "body_pct": body_pct, "close_pos": close_pos,
         "direction": direction, "volatility": volatility, "held_mid": held_mid
     }
@@ -384,21 +473,49 @@ def yesterday_summary(daily: pd.DataFrame) -> Optional[Dict[str, float]]:
 # =========================
 st.set_page_config(page_title="Pro Multi-Strike Options Dashboard (NSE+YF)", layout="wide")
 st.title("📈 Live NIFTY/BANKNIFTY Multi-Strike Options Dashboard")
-st.caption("Code 1 UI + Code 2 analytics + NSE option chain + yfinance candles + Yesterday snapshot.")
+st.caption("Code 1 UI + Code 2 analytics + NSE option chain + yfinance candles + Last trading day snapshot.")
 
-inst = st.selectbox("Select Instrument", ["NIFTY", "BANKNIFTY"])
+# -------- Controls --------
+left_ctrl, right_ctrl = st.columns([2, 1])
+
+with left_ctrl:
+    inst = st.selectbox("Select Instrument", ["NIFTY", "BANKNIFTY"])
+with right_ctrl:
+    refresh_sec = st.slider("Auto-refresh every (seconds)", 10, 120, 15)
+
 capital = st.number_input("Enter Capital (₹)", value=8000, min_value=1000, step=500)
 risk_percent = st.slider("Risk per Trade (%)", 1, 5, 2)
-refresh_sec = st.slider("Refresh every (seconds)", 10, 60, 15)
 
-st.write(f"Dashboard auto-refreshes every {refresh_sec} seconds")
+# Manual SCAN NOW
+scan_now = st.button("🔁 SCAN NOW (Manual Refresh)", use_container_width=True)
+
+# Auto-refresh
 if st_autorefresh is not None:
     st_autorefresh(interval=refresh_sec * 1000, key="refresh")
+
+# If manual scan pressed, force rerun instantly
+if scan_now:
+    st.cache_data.clear()
+    st.rerun()
+
+# Market status
+t_ist = now_ist()
+market_open = is_market_open_ist(t_ist)
+next_open = next_market_open_ist(t_ist)
+
+if not market_open:
+    st.warning(
+        f"🛑 Market is **CLOSED** (IST: {t_ist.strftime('%a %d %b %Y %H:%M')}). "
+        f"Next opening: **{next_open.strftime('%a %d %b %Y, 09:15 IST')}**. "
+        f"(Holiday accuracy needs NSE holiday calendar.)"
+    )
+else:
+    st.success(f"✅ Market is **OPEN** (IST: {t_ist.strftime('%a %d %b %Y %H:%M')})")
 
 yf_ticker = "^NSEI" if inst == "NIFTY" else "^NSEBANK"
 nse_symbol = "NIFTY" if inst == "NIFTY" else "BANKNIFTY"
 
-# Fetch intraday 5m
+# Fetch intraday 5m (yfinance)
 df = fetch_intraday_5m_yf(yf_ticker, days=5)
 if df.empty:
     st.error("No intraday data fetched (yfinance). Try again later.")
@@ -412,46 +529,41 @@ df["ATR14"] = atr(df, 14)
 
 latest = df.iloc[-1]
 close = float(latest["Close"])
-atm = int(round(close / 50.0) * 50)
 
-# Strikes (auto)
+# ATM and strikes
 step = 50 if inst == "NIFTY" else 100
+atm = int(round(close / step) * step)
 strikes = [atm - 2*step, atm - step, atm, atm + step, atm + 2*step]
 
-# NSE option chain
+# NSE option chain (best effort)
 oc = NSEWebClient(min_interval_sec=1.2).option_chain_indices(nse_symbol)
 expiry = pick_nearest_expiry(oc) if oc else None
 oc_df = option_chain_table(oc, expiry) if (oc and expiry) else pd.DataFrame()
 
-# Plan
+# Plan (only meaningful when intraday is moving — but we still compute)
 plan = compute_trade_plan(df)
 
-# Layout tabs
-tabs = st.tabs(["Live Chart", "Yesterday Snapshot", "Option Signals", "Latest Candle"])
+# Tabs
+tabs = st.tabs(["Live Chart", "Last Trading Day Snapshot", "Option Signals", "Latest Candle"])
 
 # ---------------- Live Chart ----------------
 with tabs[0]:
     fig = go.Figure(data=[go.Candlestick(
-        x=df.index,
-        open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
-        name="Candles"
+        x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="Candles"
     )])
     fig.add_trace(go.Scatter(x=df.index, y=df["EMA20"], name="EMA20"))
     fig.add_trace(go.Scatter(x=df.index, y=df["EMA50"], name="EMA50"))
     fig.add_trace(go.Scatter(x=df.index, y=df["VWAP"], name="VWAP"))
-
     fig.add_trace(go.Scatter(
-        x=[df.index[-1]], y=[close],
-        mode="markers+text",
-        text=[f"ATM {atm}"],
-        textposition="top center",
-        name="ATM",
+        x=[df.index[-1]], y=[close], mode="markers+text",
+        text=[f"ATM {atm}"], textposition="top center", name="ATM"
     ))
-
     fig.update_layout(height=420, margin=dict(l=10, r=10, t=40, b=10))
     st.plotly_chart(fig, use_container_width=True)
 
     st.subheader("🧠 Intraday Trade Plan (AUTO)")
+    if not market_open:
+        st.info("Market closed → Trade plan is shown for reference using last available intraday ticks.")
     if plan is None:
         st.warning("No clean setup right now (ORB + EMA + VWAP filters).")
     else:
@@ -463,62 +575,79 @@ with tabs[0]:
         c5.metric("Confidence", plan.confidence)
         st.info(plan.reason)
 
-# ---------------- Yesterday Snapshot ----------------
+# ---------------- Last Trading Day Snapshot ----------------
 with tabs[1]:
-    st.subheader("🕯️ Yesterday Snapshot (Open/Close + Key Points)")
+    st.subheader("🕯️ Last Trading Day Snapshot (Open/Close + Key Points)")
 
-    daily = fetch_daily_yf(yf_ticker, days=30)
-    ysum = yesterday_summary(daily)
+    daily = fetch_daily_yf(yf_ticker, days=90)
+    summ = last_trading_day_summary(daily)
 
-    if ysum is None:
-        st.warning("Not enough daily data to compute yesterday snapshot.")
+    if summ is None:
+        st.warning("Not enough daily candles to compute last trading day snapshot.")
     else:
-        # Metrics
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Yesterday Open", f"{ysum['open']:.2f}")
-        m2.metric("Yesterday Close", f"{ysum['close']:.2f}", f"{ysum['pct']:.2f}%")
-        m3.metric("Gap vs Prev Close", f"{ysum['gap']:.2f}%")
-        m4.metric("Range (H-L)", f"{ysum['range']:.2f}")
+        m1.metric("Open", f"{summ['open']:.2f}")
+        m2.metric("Close", f"{summ['close']:.2f}", f"{summ['pct']:.2f}%")
+        m3.metric("Gap vs Prev Close", f"{summ['gap']:.2f}%")
+        m4.metric("Range (H-L)", f"{summ['range']:.2f}")
 
-        # Key points bullets
         st.markdown("### Key Points")
-        st.write(f"• Date: **{ysum['date'].strftime('%d %b %Y')}**")
-        st.write(f"• Candle: **{ysum['direction']}** | Volatility: **{ysum['volatility']}**")
-        st.write(f"• Body/Range: **{ysum['body_pct']:.0f}%** (bigger = stronger conviction)")
-        st.write(f"• Close Position: **{ysum['close_pos']:.0f}%** of day range (≥70 strong, ≤30 weak)")
-        st.write(f"• Held Midpoint: **{ysum['held_mid']}** (close above midpoint supports bullish bias)")
+        st.write(f"• Date: **{summ['date'].strftime('%d %b %Y')}**")
+        st.write(f"• Candle: **{summ['direction']}** | Volatility: **{summ['volatility']}**")
+        st.write(f"• Body/Range: **{summ['body_pct']:.0f}%** (bigger = stronger conviction)")
+        st.write(f"• Close Position: **{summ['close_pos']:.0f}%** of day range (≥70 strong, ≤30 weak)")
+        st.write(f"• Held Midpoint: **{summ['held_mid']}** (close above midpoint supports bullish bias)")
 
-        # Chart: last 10 daily candles, highlight yesterday
         show = daily.tail(10).copy()
         figd = go.Figure(data=[go.Candlestick(
-            x=show.index,
-            open=show["Open"], high=show["High"], low=show["Low"], close=show["Close"],
-            name="Daily"
+            x=show.index, open=show["Open"], high=show["High"], low=show["Low"], close=show["Close"], name="Daily"
         )])
-
-        # vertical line on yesterday
-        y_date = pd.Timestamp(ysum["date"])
-        figd.add_vline(x=y_date, line_dash="dot", annotation_text="Yesterday", annotation_position="top left")
-
-        figd.update_layout(height=420, margin=dict(l=10, r=10, t=40, b=10), title=f"{inst} — Last 10 Daily Candles (Yesterday marked)")
+        figd.add_vline(
+            x=pd.Timestamp(summ["date"]),
+            line_dash="dot",
+            annotation_text="Last Trading Day",
+            annotation_position="top left"
+        )
+        figd.update_layout(height=420, margin=dict(l=10, r=10, t=40, b=10),
+                           title=f"{inst} — Last 10 Daily Candles (Last trading day marked)")
         st.plotly_chart(figd, use_container_width=True)
 
 # ---------------- Option Signals ----------------
 with tabs[2]:
-    st.subheader("🎯 Multi-Strike Option Signals (Premiums from NSE Option Chain)")
+    st.subheader("🎯 Multi-Strike Option Signals (NSE Option Chain)")
 
-    if oc_df.empty:
-        st.error("Option chain not available (NSE blocked / rate limit). Premium columns will be blank.")
-
-    signals_df = build_multi_strike_table(strikes, oc_df, plan, capital, risk_percent)
-    st.dataframe(signals_df, use_container_width=True, hide_index=True)
-
-    if expiry:
-        st.caption(f"Option Chain Expiry used: {expiry}")
+    # If market is closed → show NULL table + message
+    if not market_open:
+        st.info("Market closed → Options table shown with NULL values (as you asked).")
+        signals_df = build_multi_strike_table(
+            strikes=strikes,
+            oc_df=pd.DataFrame(),
+            plan=None,
+            capital=capital,
+            risk_percent=risk_percent,
+            force_null=True
+        )
+        st.dataframe(signals_df, use_container_width=True, hide_index=True)
+        st.caption("When market opens, premiums/OI will populate automatically (subject to NSE access).")
+    else:
+        if oc_df.empty:
+            st.warning("Option chain not available (NSE blocked / rate limit). Premium/OI may be blank.")
+        signals_df = build_multi_strike_table(
+            strikes=strikes,
+            oc_df=oc_df,
+            plan=plan,
+            capital=capital,
+            risk_percent=risk_percent,
+            force_null=False
+        )
+        st.dataframe(signals_df, use_container_width=True, hide_index=True)
+        if expiry:
+            st.caption(f"Option Chain Expiry used: {expiry}")
 
 # ---------------- Latest Candle ----------------
 with tabs[3]:
     st.subheader("📊 Latest Market Candle (5m)")
     st.write(latest)
 
-st.caption("Note: NSE endpoints are unofficial and can fail. Intraday/daily candles come from yfinance for reliability.")
+st.caption("Note: NSE endpoints are unofficial and can fail on cloud. Intraday/daily candles come from yfinance for reliability.")
+
