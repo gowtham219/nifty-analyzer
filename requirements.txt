@@ -1,16 +1,8 @@
 streamlit
 streamlit-autorefresh
-
 pandas
 numpy
 requests
-
 plotly
-matplotlib
-
 yfinance
-feedparser
-vaderSentiment
-
 pyarrow
-pytz
