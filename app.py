@@ -6,112 +6,107 @@ import plotly.graph_objects as go
 
 st.set_page_config(page_title="NIFTY Intraday Signal Scanner", layout="wide")
 
-# -------------------- Indicator helpers -------------------- #
+
+# ===================== INDICATORS ===================== #
 def ema(series: pd.Series, length: int) -> pd.Series:
     return series.ewm(span=length, adjust=False).mean()
+
 
 def rsi(series: pd.Series, length: int = 14) -> pd.Series:
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1/length, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/length, adjust=False).mean()
+
+    avg_gain = gain.ewm(alpha=1 / length, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / length, adjust=False).mean()
+
     rs = avg_gain / avg_loss.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
+
 
 def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
     high = df["High"]
     low = df["Low"]
     close = df["Close"]
     prev_close = close.shift(1)
-    tr = pd.concat([
-        (high - low),
-        (high - prev_close).abs(),
-        (low - prev_close).abs()
-    ], axis=1).max(axis=1)
-    return tr.ewm(alpha=1/length, adjust=False).mean()
+
+    tr = pd.concat(
+        [
+            (high - low),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    return tr.ewm(alpha=1 / length, adjust=False).mean()
+
 
 def crossover(a: pd.Series, b: pd.Series) -> bool:
-    # last candle cross
+    # last candle crossover only
     if len(a) < 2 or len(b) < 2:
         return False
     return (a.iloc[-2] <= b.iloc[-2]) and (a.iloc[-1] > b.iloc[-1])
+
 
 def crossunder(a: pd.Series, b: pd.Series) -> bool:
     if len(a) < 2 or len(b) < 2:
         return False
     return (a.iloc[-2] >= b.iloc[-2]) and (a.iloc[-1] < b.iloc[-1])
 
-# -------------------- Data fetch -------------------- #
+
+# ===================== DATA ===================== #
 @st.cache_data(ttl=60)
 def fetch_intraday(symbol: str, period: str = "5d", interval: str = "5m") -> pd.DataFrame:
+    """
+    Fetch intraday OHLC from Yahoo via yfinance.
+    """
     df = yf.download(
         tickers=symbol,
         period=period,
         interval=interval,
         auto_adjust=False,
         progress=False,
-        threads=True
+        threads=True,
     )
+
     if df is None or df.empty:
         return pd.DataFrame()
+
     df = df.reset_index()
-    df.columns = [c.replace(" ", "_") for c in df.columns]
+
+    # Make sure we have a clean time column
+    if "Datetime" in df.columns:
+        pass
+    elif "Date" in df.columns:
+        pass
+    else:
+        # rename first column to Datetime if unknown
+        df.rename(columns={df.columns[0]: "Datetime"}, inplace=True)
+
+    # Make sure required columns exist
+    required = {"Open", "High", "Low", "Close", "Volume"}
+    if not required.issubset(set(df.columns)):
+        return pd.DataFrame()
+
+    # Ensure numeric
     for c in ["Open", "High", "Low", "Close", "Volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
+
     df = df.dropna(subset=["Open", "High", "Low", "Close"]).copy()
     return df
 
-def plot_chart(df: pd.DataFrame, title: str) -> go.Figure:
-    xcol = "Datetime" if "Datetime" in df.columns else ("Date" if "Date" in df.columns else df.columns[0])
 
-    fig = go.Figure()
-    fig.add_trace(go.Candlestick(
-        x=df[xcol],
-        open=df["Open"],
-        high=df["High"],
-        low=df["Low"],
-        close=df["Close"],
-        name="Candles"
-    ))
-
-    fig.add_trace(go.Scatter(x=df[xcol], y=df["EMA_FAST"], mode="lines", name="EMA Fast"))
-    fig.add_trace(go.Scatter(x=df[xcol], y=df["EMA_SLOW"], mode="lines", name="EMA Slow"))
-
-    # markers for the latest signal
-    if df["CALL_FLAG"].any():
-        calls = df[df["CALL_FLAG"]]
-        fig.add_trace(go.Scatter(
-            x=calls[xcol], y=calls["Close"],
-            mode="markers", name="CALL",
-            marker=dict(symbol="triangle-up", size=12)
-        ))
-    if df["PUT_FLAG"].any():
-        puts = df[df["PUT_FLAG"]]
-        fig.add_trace(go.Scatter(
-            x=puts[xcol], y=puts["Close"],
-            mode="markers", name="PUT",
-            marker=dict(symbol="triangle-down", size=12)
-        ))
-
-    fig.update_layout(
-        title=title,
-        xaxis_title="Time",
-        yaxis_title="Price",
-        xaxis_rangeslider_visible=False,
-        height=650
-    )
-    return fig
-
-# -------------------- Signal logic -------------------- #
-def build_trade_now_signal(df: pd.DataFrame) -> dict:
+# ===================== SIGNAL + TRADE PLAN ===================== #
+def compute_trade_now(df: pd.DataFrame) -> tuple[dict, pd.DataFrame]:
     """
-    Returns a single 'trade now' plan based on the most recent candle.
-    Strategy: EMA9/EMA21 + RSI filter + ATR based SL/targets.
+    Strategy (fixed params for minimal UI):
+    - EMA 9 / EMA 21 cross
+    - RSI filter: CALL >= 55, PUT <= 45
+    - ATR-based SL and targets
     """
-    # Parameters (kept fixed since you want minimal UI)
-    EMA_FAST_LEN = 9
-    EMA_SLOW_LEN = 21
+    EMA_FAST = 9
+    EMA_SLOW = 21
     RSI_LEN = 14
     RSI_CALL_MIN = 55
     RSI_PUT_MAX = 45
@@ -122,107 +117,174 @@ def build_trade_now_signal(df: pd.DataFrame) -> dict:
     T2_ATR = 3.0
 
     df = df.copy()
-    df["EMA_FAST"] = ema(df["Close"], EMA_FAST_LEN)
-    df["EMA_SLOW"] = ema(df["Close"], EMA_SLOW_LEN)
+    df["EMA_FAST"] = ema(df["Close"], EMA_FAST)
+    df["EMA_SLOW"] = ema(df["Close"], EMA_SLOW)
     df["RSI"] = rsi(df["Close"], RSI_LEN)
     df["ATR"] = atr(df, ATR_LEN)
 
-    # Latest cross check
-    call_cross = crossover(df["EMA_FAST"], df["EMA_SLOW"]) and (df["RSI"].iloc[-1] >= RSI_CALL_MIN)
-    put_cross  = crossunder(df["EMA_FAST"], df["EMA_SLOW"]) and (df["RSI"].iloc[-1] <= RSI_PUT_MAX)
-
-    # Mark only the last candle as signal marker (for chart)
+    # default flags
     df["CALL_FLAG"] = False
     df["PUT_FLAG"] = False
-    if call_cross:
-        df.loc[df.index[-1], "CALL_FLAG"] = True
-    if put_cross:
-        df.loc[df.index[-1], "PUT_FLAG"] = True
 
-    last_close = float(df["Close"].iloc[-1])
-    last_atr = float(df["ATR"].iloc[-1]) if not np.isnan(df["ATR"].iloc[-1]) else 0.0
-    last_rsi = float(df["RSI"].iloc[-1]) if not np.isnan(df["RSI"].iloc[-1]) else np.nan
+    last_rsi = df["RSI"].iloc[-1]
+    last_atr = df["ATR"].iloc[-1]
+    last_close = df["Close"].iloc[-1]
 
-    if call_cross:
-        side = "CALL"
-        entry = last_close
-        sl = entry - (last_atr * SL_ATR)
-        t1 = entry + (last_atr * T1_ATR)
-        t2 = entry + (last_atr * T2_ATR)
-        confidence = "Trend up + momentum"
-    elif put_cross:
-        side = "PUT"
-        entry = last_close
-        sl = entry + (last_atr * SL_ATR)
-        t1 = entry - (last_atr * T1_ATR)
-        t2 = entry - (last_atr * T2_ATR)
-        confidence = "Trend down + momentum"
-    else:
-        side = "NO TRADE"
-        entry = last_close
-        sl = np.nan
-        t1 = np.nan
-        t2 = np.nan
-        confidence = "No valid EMA cross + RSI filter"
+    call_ok = crossover(df["EMA_FAST"], df["EMA_SLOW"]) and (last_rsi >= RSI_CALL_MIN)
+    put_ok = crossunder(df["EMA_FAST"], df["EMA_SLOW"]) and (last_rsi <= RSI_PUT_MAX)
 
     plan = {
-        "Side": side,
-        "Entry": round(entry, 2),
-        "StopLoss": (round(sl, 2) if not np.isnan(sl) else None),
-        "Target1": (round(t1, 2) if not np.isnan(t1) else None),
-        "Target2": (round(t2, 2) if not np.isnan(t2) else None),
-        "RSI": round(last_rsi, 2) if not np.isnan(last_rsi) else None,
-        "ATR": round(last_atr, 2),
-        "Note": confidence,
+        "Side": "NO TRADE",
+        "Entry": round(float(last_close), 2),
+        "StopLoss": None,
+        "Target1": None,
+        "Target2": None,
+        "RSI": None if np.isnan(last_rsi) else round(float(last_rsi), 2),
+        "ATR": None if np.isnan(last_atr) else round(float(last_atr), 2),
+        "Note": "No valid signal",
     }
+
+    if call_ok and not np.isnan(last_atr):
+        df.loc[df.index[-1], "CALL_FLAG"] = True
+
+        entry = float(last_close)
+        sl = entry - (float(last_atr) * SL_ATR)
+        t1 = entry + (float(last_atr) * T1_ATR)
+        t2 = entry + (float(last_atr) * T2_ATR)
+
+        plan.update(
+            {
+                "Side": "CALL",
+                "StopLoss": round(sl, 2),
+                "Target1": round(t1, 2),
+                "Target2": round(t2, 2),
+                "Note": "EMA bullish cross + RSI support",
+            }
+        )
+
+    elif put_ok and not np.isnan(last_atr):
+        df.loc[df.index[-1], "PUT_FLAG"] = True
+
+        entry = float(last_close)
+        sl = entry + (float(last_atr) * SL_ATR)
+        t1 = entry - (float(last_atr) * T1_ATR)
+        t2 = entry - (float(last_atr) * T2_ATR)
+
+        plan.update(
+            {
+                "Side": "PUT",
+                "StopLoss": round(sl, 2),
+                "Target1": round(t1, 2),
+                "Target2": round(t2, 2),
+                "Note": "EMA bearish cross + RSI support",
+            }
+        )
 
     return plan, df
 
-# -------------------- UI -------------------- #
-st.title("📌 NIFTY Intraday Scanner (Trade Now)")
 
-col1, col2 = st.columns([2, 1])
-with col1:
-    market = st.selectbox("Select", ["NIFTY 50", "NIFTY BANK"])
-with col2:
+# ===================== PLOT ===================== #
+def plot_chart(df: pd.DataFrame, title: str) -> go.Figure:
+    time_col = "Datetime" if "Datetime" in df.columns else "Date"
+
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Candlestick(
+            x=df[time_col],
+            open=df["Open"],
+            high=df["High"],
+            low=df["Low"],
+            close=df["Close"],
+            name="Candles",
+        )
+    )
+
+    fig.add_trace(go.Scatter(x=df[time_col], y=df["EMA_FAST"], mode="lines", name="EMA 9"))
+    fig.add_trace(go.Scatter(x=df[time_col], y=df["EMA_SLOW"], mode="lines", name="EMA 21"))
+
+    calls = df[df["CALL_FLAG"]]
+    puts = df[df["PUT_FLAG"]]
+
+    if not calls.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=calls[time_col],
+                y=calls["Close"],
+                mode="markers",
+                name="CALL",
+                marker=dict(symbol="triangle-up", size=12),
+            )
+        )
+
+    if not puts.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=puts[time_col],
+                y=puts["Close"],
+                mode="markers",
+                name="PUT",
+                marker=dict(symbol="triangle-down", size=12),
+            )
+        )
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="Time",
+        yaxis_title="Price",
+        xaxis_rangeslider_visible=False,
+        height=650,
+    )
+    return fig
+
+
+# ===================== UI ===================== #
+st.title("📈 NIFTY Intraday Signal Scanner (Manual Scan)")
+
+c1, c2 = st.columns([2, 1])
+
+with c1:
+    market = st.selectbox("Select Index", ["NIFTY 50", "NIFTY BANK"])
+
+with c2:
     scan = st.button("🔍 Scan Now", use_container_width=True)
 
 symbol = "^NSEI" if market == "NIFTY 50" else "^NSEBANK"
 
-# Only run analysis when Scan Now is clicked
-if scan:
-    st.cache_data.clear()  # force fresh fetch on manual scan
+if not scan:
+    st.info("Select index and click **Scan Now** to run analysis.")
+    st.stop()
 
-    with st.spinner("Scanning…"):
-        df = fetch_intraday(symbol, period="5d", interval="5m")
+# Manual refresh
+st.cache_data.clear()
 
-    if df.empty:
-        st.error("No data received. Try again later or change interval/provider.")
-        st.stop()
+with st.spinner("Scanning latest candles…"):
+    df = fetch_intraday(symbol, period="5d", interval="5m")
 
-    plan, df2 = build_trade_now_signal(df)
+if df.empty:
+    st.error("No data received. Try again later (free sources can fail sometimes).")
+    st.stop()
 
-    # Chart
-    fig = plot_chart(df2, f"{market} ({symbol}) • 5m candles • EMA9/EMA21 + RSI filter")
-    st.plotly_chart(fig, use_container_width=True)
+plan, df2 = compute_trade_now(df)
 
-    # Trade Now card
-    st.subheader("✅ Trade Signal (Now)")
-    if plan["Side"] == "NO TRADE":
-        st.warning(f"**NO TRADE** — {plan['Note']} | RSI: {plan['RSI']} | ATR: {plan['ATR']}")
-    else:
-        st.success(
-            f"**{plan['Side']}** | Entry: **{plan['Entry']}** | SL: **{plan['StopLoss']}** | "
-            f"T1: **{plan['Target1']}** | T2: **{plan['Target2']}**  \n"
-            f"RSI: {plan['RSI']} • ATR: {plan['ATR']} • {plan['Note']}"
-        )
+# Chart
+fig = plot_chart(df2, f"{market} • 5m Candles • EMA9/EMA21 + RSI + ATR (Trade Now)")
+st.plotly_chart(fig, use_container_width=True)
 
-    # Below table: last 10 candles + indicators for quick verification
-    st.subheader("📊 Recent Data (quick verification)")
-    xcol = "Datetime" if "Datetime" in df2.columns else ("Date" if "Date" in df2.columns else df2.columns[0])
-    view = df2[[xcol, "Open", "High", "Low", "Close", "EMA_FAST", "EMA_SLOW", "RSI", "ATR"]].tail(15).copy()
-    view = view.rename(columns={xcol: "Time"})
-    st.dataframe(view, use_container_width=True, height=320)
-
+# Signal card
+st.subheader("✅ Trade Signal (Take Now)")
+if plan["Side"] == "NO TRADE":
+    st.warning(f"**NO TRADE** — {plan['Note']} | RSI: {plan['RSI']} | ATR: {plan['ATR']}")
 else:
-    st.info("Select NIFTY 50 / NIFTY BANK and press **Scan Now**.")
+    st.success(
+        f"**{plan['Side']}** | Entry: **{plan['Entry']}** | SL: **{plan['StopLoss']}** | "
+        f"T1: **{plan['Target1']}** | T2: **{plan['Target2']}**\n\n"
+        f"RSI: {plan['RSI']} • ATR: {plan['ATR']} • {plan['Note']}"
+    )
+
+# Recent verification table
+st.subheader("📊 Recent Candles (Verification)")
+time_col = "Datetime" if "Datetime" in df2.columns else "Date"
+view = df2[[time_col, "Open", "High", "Low", "Close", "EMA_FAST", "EMA_SLOW", "RSI", "ATR"]].tail(15).copy()
+view.rename(columns={time_col: "Time"}, inplace=True)
+st.dataframe(view, use_container_width=True, height=320)
